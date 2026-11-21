@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: orderflow-config
+data:
+  PORT: "8080"
+  REDIS_URL: redis://redis:6379/0
+  KAFKA_BROKERS: kafka:29092
+  KAFKA_TOPIC: order-events
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+data:
+  001_create_orders.sql: |
+    CREATE EXTENSION IF NOT EXISTS pgcrypto;
+    CREATE TABLE IF NOT EXISTS orders (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        amount NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
+        currency VARCHAR(3) NOT NULL DEFAULT 'RUB' CHECK (currency ~ '^[A-Z]{3}$'),
+        status VARCHAR(20) NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders (created_at DESC);
+  004_order_requests.sql: |
+    CREATE TABLE IF NOT EXISTS order_requests (key text PRIMARY KEY, amount numeric(12,2) NOT NULL, currency text NOT NULL, response jsonb NOT NULL);
+  003_order_pages.sql: |
+    CREATE INDEX IF NOT EXISTS orders_page ON orders (created_at DESC,id DESC);
+    CREATE INDEX IF NOT EXISTS orders_status_page ON orders (status,created_at DESC,id DESC);
+  002_create_order_outbox.sql: |
+    CREATE TABLE IF NOT EXISTS order_outbox (
+        id BIGSERIAL PRIMARY KEY,
+        event_type VARCHAR(100) NOT NULL,
+        order_id UUID NOT NULL,
+        payload JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        published_at TIMESTAMPTZ,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_outbox_unpublished
+        ON order_outbox (id)
+        WHERE published_at IS NULL;
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      - job_name: orderflow-api
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["orderflow-api:8080"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: false
+  dashboard-provider.yml: |
+    apiVersion: 1
+    providers:
+      - name: OrderFlow
+        orgId: 1
+        folder: OrderFlow
+        type: file
+        editable: true
+        options:
+          path: /etc/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard
+data:
+  orderflow.json: |
+    {
+      "annotations": {"list": []},
+      "editable": true,
+      "panels": [
+        {"datasource":{"type":"prometheus","uid":"prometheus"},"fieldConfig":{"defaults":{"unit":"reqps"},"overrides":[]},"gridPos":{"h":9,"w":12,"x":0,"y":0},"id":1,"targets":[{"expr":"sum by (route) (rate(orderflow_http_requests_total[5m]))","legendFormat":"{{route}}","refId":"A"}],"title":"HTTP request rate","type":"timeseries"},
+        {"datasource":{"type":"prometheus","uid":"prometheus"},"fieldConfig":{"defaults":{"unit":"s"},"overrides":[]},"gridPos":{"h":9,"w":12,"x":12,"y":0},"id":2,"targets":[{"expr":"histogram_quantile(0.95, sum by (le, route) (rate(orderflow_http_request_duration_seconds_bucket[5m])))","legendFormat":"p95 {{route}}","refId":"A"}],"title":"HTTP latency (p95)","type":"timeseries"},
+        {"datasource":{"type":"prometheus","uid":"prometheus"},"fieldConfig":{"defaults":{},"overrides":[]},"gridPos":{"h":8,"w":24,"x":0,"y":9},"id":3,"targets":[{"expr":"sum by (status) (rate(orderflow_http_requests_total[5m]))","legendFormat":"HTTP {{status}}","refId":"A"}],"title":"Responses by status code","type":"timeseries"}
+      ],
+      "refresh":"15s",
+      "schemaVersion":39,
+      "tags":["orderflow"],
+      "time":{"from":"now-1h","to":"now"},
+      "title":"OrderFlow API",
+      "uid":"orderflow-api",
+      "version":1
+    }

@@ -1,0 +1,44 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [{"expr": "sum by (route) (rate(orderflow_http_requests_total[5m]))", "legendFormat": "{{route}}", "refId": "A"}],
+      "title": "HTTP request rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "custom": {"drawStyle": "line", "lineWidth": 2}}, "overrides": []},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, route) (rate(orderflow_http_request_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{route}}", "refId": "A"}],
+      "title": "HTTP latency (p95)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 9},
+      "id": 3,
+      "targets": [{"expr": "sum by (status) (rate(orderflow_http_requests_total[5m]))", "legendFormat": "HTTP {{status}}", "refId": "A"}],
+      "title": "Responses by status code",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["orderflow"],
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "OrderFlow API",
+  "uid": "orderflow-api",
+  "version": 1
+}

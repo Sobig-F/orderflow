@@ -1,0 +1,136 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Go application
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd internal)"
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -coverprofile=coverage.out ./...
+      - name: Enforce 95% total coverage
+        run: |
+          go tool cover -func=coverage.out | tail -n 1
+          go tool cover -func=coverage.out | awk '/^total:/ { gsub(/%/, "", $3); if ($3 < 95) exit 1 }'
+      - name: Build
+        run: go build ./...
+      - name: Validate Kubernetes manifests
+        uses: azure/setup-kubectl@v4
+      - name: Render Kustomize bundle
+        run: kubectl kustomize k8s > /dev/null
+      - name: Validate Docker Compose
+        run: docker compose config -q
+      - name: Build container image
+        run: docker build -t orderflow:ci .
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up --build --wait api
+      - run: bash tests/integration/orders.sh
+      - if: always()
+        run: docker compose down -v
+
+  publish:
+    name: Build and publish container
+    needs: [verify, integration]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: image
+        name: Set image name
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: metadata
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha,prefix=sha-
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to Kubernetes
+    needs: publish
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.KUBE_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      ORDERFLOW_DATABASE_URL: ${{ secrets.ORDERFLOW_DATABASE_URL }}
+      POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+      POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+      GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+      GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+      GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: Configure cluster access
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+      - name: Create namespace and runtime secrets
+        run: |
+          kubectl create namespace orderflow --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n orderflow create secret generic orderflow-secrets \
+            --from-literal=DATABASE_URL="$ORDERFLOW_DATABASE_URL" \
+            --from-literal=POSTGRES_USER="$POSTGRES_USER" \
+            --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            --from-literal=GRAFANA_ADMIN_PASSWORD="$GRAFANA_ADMIN_PASSWORD" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl -n orderflow create secret docker-registry ghcr-pull \
+            --docker-server=ghcr.io \
+            --docker-username="$GHCR_USERNAME" \
+            --docker-password="$GHCR_READ_TOKEN" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Apply Kubernetes resources
+        run: kubectl apply -k k8s
+      - name: Roll out published image
+        run: |
+          kubectl -n orderflow set image deployment/orderflow-api \
+            api=${{ needs.publish.outputs.image }}:sha-${GITHUB_SHA}
+          kubectl -n orderflow rollout status deployment/orderflow-api --timeout=5m
